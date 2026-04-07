@@ -52,6 +52,7 @@ test = [
 [project.scripts]
 mongo-launch = "mongo_orchestration.launch:main"
 mongo-orchestration = "mongo_orchestration.server:main"
+mongo-orchestration-mcp = "mongo_orchestration.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/10gen/mongo-orchestration"
