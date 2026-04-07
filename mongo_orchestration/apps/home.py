@@ -51,6 +51,13 @@ _HTML = """\
                 border: 1px solid #fca5a5; border-radius: 4px; padding: 4px 10px;
                 font-size: 0.8rem; cursor: pointer; }
     .stop-btn:hover { background: #fecaca; }
+    .add-btn { flex-shrink: 0; background: #f0fdf4; color: #15803d; border: 1px solid #86efac;
+               border-radius: 4px; padding: 4px 10px; font-size: 0.8rem; cursor: pointer; }
+    .add-btn:hover { background: #dcfce7; }
+    .remove-btn { margin-left: auto; flex-shrink: 0; background: #fef9c3; color: #92400e;
+                  border: 1px solid #fde68a; border-radius: 4px; padding: 2px 7px;
+                  font-size: 0.75rem; cursor: pointer; }
+    .remove-btn:hover { background: #fef3c7; }
 
     /* ── Nested members ─────────────────────────────────────────── */
     .members { padding: 0 16px 8px; }
@@ -170,13 +177,17 @@ _HTML = """\
       return '<span class="role ' + cls + '">' + label + '</span>';
     }
 
-    function renderRsMembers(members) {
+    function renderRsMembers(rsId, members, removable) {
       if (!members?.length) return '';
       return members.map(m =>
         '<div class="member">'
         + renderMemberRole(m.state)
         + '<span class="host">' + esc(m.host) + '</span>'
         + (m._uri ? '<span class="member-uri">' + esc(m._uri) + '</span>' : '')
+        + (removable
+          ? '<button class="remove-btn" data-action="remove-member"'
+            + ' data-rs="' + esc(rsId) + '" data-member="' + m._id + '">Remove</button>'
+          : '')
         + '</div>'
       ).join('');
     }
@@ -194,7 +205,7 @@ _HTML = """\
         + '<span class="id">' + esc(d.id) + '</span>'
         + renderVersion(ver)
         + '<span class="uri">' + esc(uri) + '</span>'
-        + '<button class="stop-btn" data-res="servers" data-id="' + esc(d.id) + '">Stop</button>'
+        + '<button class="stop-btn" data-action="stop" data-res="servers" data-id="' + esc(d.id) + '">Stop</button>'
         + '</div></div>';
     }
 
@@ -207,9 +218,10 @@ _HTML = """\
         + '<span class="id">' + esc(d.id) + '</span>'
         + renderVersion(ver)
         + '<span class="uri">' + esc(uri) + '</span>'
-        + '<button class="stop-btn" data-res="replica_sets" data-id="' + esc(d.id) + '">Stop</button>'
+        + '<button class="add-btn" data-action="add-member" data-rs="' + esc(d.id) + '">+ Member</button>'
+        + '<button class="stop-btn" data-action="stop" data-res="replica_sets" data-id="' + esc(d.id) + '">Stop</button>'
         + '</div>'
-        + '<div class="members">' + renderRsMembers(d.members) + '</div>'
+        + '<div class="members">' + renderRsMembers(d.id, d.members, true) + '</div>'
         + '</div>';
     }
 
@@ -225,6 +237,8 @@ _HTML = """\
           + '<span class="badge badge-mongos">mongos</span>'
           + '<span class="host">' + esc(r.hostname || r.id) + '</span>'
           + (r._uri ? '<span class="member-uri">' + esc(r._uri) + '</span>' : '')
+          + '<button class="remove-btn" data-action="remove-router"'
+          + ' data-cluster="' + esc(d.id) + '" data-router="' + esc(r.id) + '">Remove</button>'
           + '</div>'
         ).join('');
       }
@@ -243,12 +257,14 @@ _HTML = """\
         inner += '<div class="section-label">Shards</div>';
         inner += d.shards.map(sh => {
           let shHtml = '<div class="member" style="flex-wrap:wrap;gap:4px;">'
-            + '<span class="badge badge-repl">' + esc(sh.id) + '</span>';
+            + '<span class="badge badge-repl">' + esc(sh.id) + '</span>'
+            + '<button class="remove-btn" data-action="remove-shard"'
+            + ' data-cluster="' + esc(d.id) + '" data-shard="' + esc(sh.id) + '">Remove</button>'
+            + '</div>';
           if (sh._rsMembers?.length) {
-            shHtml += '</div><div style="padding-left:24px;">'
-              + renderRsMembers(sh._rsMembers);
-          } else {
-            shHtml += '</div>';
+            shHtml += '<div style="padding-left:24px;">'
+              + renderRsMembers(sh._id, sh._rsMembers, false)
+              + '</div>';
           }
           return shHtml;
         }).join('');
@@ -260,7 +276,9 @@ _HTML = """\
         + '<span class="id">' + esc(d.id) + '</span>'
         + renderVersion(ver)
         + '<span class="uri">' + esc(uri) + '</span>'
-        + '<button class="stop-btn" data-res="sharded_clusters" data-id="' + esc(d.id) + '">Stop</button>'
+        + '<button class="add-btn" data-action="add-router" data-cluster="' + esc(d.id) + '">+ Router</button>'
+        + '<button class="add-btn" data-action="add-shard" data-cluster="' + esc(d.id) + '">+ Shard</button>'
+        + '<button class="stop-btn" data-action="stop" data-res="sharded_clusters" data-id="' + esc(d.id) + '">Stop</button>'
         + '</div>'
         + '<div class="members">' + inner + '</div>'
         + '</div>';
@@ -355,17 +373,49 @@ _HTML = """\
         ? parts.join('')
         : '<p class="empty">No clusters running.</p>';
 
-      el.querySelectorAll('.stop-btn').forEach(btn =>
-        btn.addEventListener('click', () => stopCluster(btn.dataset.res, btn.dataset.id)));
+      el.addEventListener('click', async e => {
+        const btn = e.target.closest('button[data-action]');
+        if (!btn || btn.disabled) return;
+        const { action, res, id, rs, member, cluster, router, shard } = btn.dataset;
+        btn.disabled = true;
+
+        const post = (path, body = {}) => api(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (action === 'stop') {
+          if (!confirm('Stop ' + id + '?')) { btn.disabled = false; return; }
+          await api(res + '/' + id, { method: 'DELETE' });
+
+        } else if (action === 'add-member') {
+          await post('replica_sets/' + rs + '/members', { procParams: {} });
+
+        } else if (action === 'remove-member') {
+          if (!confirm('Remove member ' + member + '?')) { btn.disabled = false; return; }
+          await api('replica_sets/' + rs + '/members/' + member, { method: 'DELETE' });
+
+        } else if (action === 'add-router') {
+          await post('sharded_clusters/' + cluster + '/routers', {});
+
+        } else if (action === 'remove-router') {
+          if (!confirm('Remove router ' + router + '?')) { btn.disabled = false; return; }
+          await api('sharded_clusters/' + cluster + '/routers/' + router, { method: 'DELETE' });
+
+        } else if (action === 'add-shard') {
+          await post('sharded_clusters/' + cluster + '/shards', { procParams: {} });
+
+        } else if (action === 'remove-shard') {
+          if (!confirm('Remove shard ' + shard + '?')) { btn.disabled = false; return; }
+          await api('sharded_clusters/' + cluster + '/shards/' + shard, { method: 'DELETE' });
+        }
+
+        loadClusters();
+      });
 
       document.getElementById('refresh-info').textContent =
         'updated ' + new Date().toLocaleTimeString();
-    }
-
-    async function stopCluster(resource, id) {
-      if (!confirm('Stop ' + id + '?')) return;
-      await api(resource + '/' + id, { method: 'DELETE' });
-      loadClusters();
     }
 
     async function loadVersions() {
