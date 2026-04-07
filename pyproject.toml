@@ -43,8 +43,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mcp = [
+    "mcp>=1.0",
+]
 test = [
     "coverage>=3.5",
+    "mcp>=1.0",
     "pexpect",
     "pytest",
 ]
