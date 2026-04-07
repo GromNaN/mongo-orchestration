@@ -176,6 +176,7 @@ _HTML = """\
         '<div class="member">'
         + renderMemberRole(m.state)
         + '<span class="host">' + esc(m.host) + '</span>'
+        + (m._uri ? '<span class="member-uri">' + esc(m._uri) + '</span>' : '')
         + '</div>'
       ).join('');
     }
@@ -223,6 +224,7 @@ _HTML = """\
           '<div class="member">'
           + '<span class="badge badge-mongos">mongos</span>'
           + '<span class="host">' + esc(r.hostname || r.id) + '</span>'
+          + (r._uri ? '<span class="member-uri">' + esc(r._uri) + '</span>' : '')
           + '</div>'
         ).join('');
       }
@@ -266,65 +268,88 @@ _HTML = """\
 
     // ── Data loading ───────────────────────────────────────────────────────
 
+    async function serverDetail(id) {
+      try { return (await api('servers/' + id)).data; } catch { return null; }
+    }
+
+    async function enrichMembers(members) {
+      // Fetch server details for each RS member, attach _uri and track server IDs.
+      const ids = new Set();
+      await Promise.all((members ?? []).map(async m => {
+        if (!m.server_id) return;
+        ids.add(m.server_id);
+        const sv = await serverDetail(m.server_id);
+        m._uri = sv?.mongodb_auth_uri || sv?.mongodb_uri || '';
+        m._version = sv?.serverInfo?.version || '';
+      }));
+      return ids;
+    }
+
     async function loadClusters() {
       document.getElementById('refresh-info').textContent = 'refreshing\u2026';
-      const parts = [];
+      const usedServerIds = new Set();
+      const rsParts = [];
+      const shardParts = [];
 
-      // Standalone servers
-      try {
-        const { data } = await api('servers');
-        for (const item of data?.servers ?? []) {
-          const { data: d } = await api('servers/' + item.id);
-          if (d) parts.push(renderServer(d));
-        }
-      } catch { /* unreachable */ }
-
-      // Replica sets
+      // ── Replica sets ─────────────────────────────────────────────────
       try {
         const { data } = await api('replica_sets');
         for (const item of data?.replica_sets ?? []) {
           const { data: d } = await api('replica_sets/' + item.id);
-          if (d) {
-            // Get version from the primary (or first) member's server info
-            const primary = d.members?.find(m => m.state === 1) ?? d.members?.[0];
-            if (primary?.server_id) {
-              try {
-                const { data: sv } = await api('servers/' + primary.server_id);
-                d._version = sv?.serverInfo?.version ?? '';
-              } catch { /* ignore */ }
-            }
-            parts.push(renderReplicaSet(d));
-          }
+          if (!d) continue;
+          const ids = await enrichMembers(d.members);
+          ids.forEach(id => usedServerIds.add(id));
+          const ref = d.members?.find(m => m.state === 1) ?? d.members?.[0];
+          d._version = ref?._version || '';
+          rsParts.push(renderReplicaSet(d));
         }
       } catch { /* unreachable */ }
 
-      // Sharded clusters
+      // ── Sharded clusters ─────────────────────────────────────────────
       try {
         const { data } = await api('sharded_clusters');
         for (const item of data?.sharded_clusters ?? []) {
           const { data: d } = await api('sharded_clusters/' + item.id);
-          if (d) {
-            // Get version from the first router
-            if (d.routers?.[0]?.id) {
+          if (!d) continue;
+
+          // Enrich routers
+          await Promise.all((d.routers ?? []).map(async r => {
+            usedServerIds.add(r.id);
+            const sv = await serverDetail(r.id);
+            r._uri = sv?.mongodb_uri || '';
+            if (!d._version && sv?.serverInfo?.version) d._version = sv.serverInfo.version;
+          }));
+
+          // Track config servers
+          (d.configsvrs ?? []).forEach(c => usedServerIds.add(c.id));
+
+          // Enrich shard RS members
+          for (const sh of d.shards ?? []) {
+            if (sh.isReplicaSet && sh._id) {
               try {
-                const { data: sv } = await api('servers/' + d.routers[0].id);
-                d._version = sv?.serverInfo?.version ?? '';
+                const { data: rs } = await api('replica_sets/' + sh._id);
+                sh._rsMembers = rs?.members ?? [];
+                const ids = await enrichMembers(sh._rsMembers);
+                ids.forEach(id => usedServerIds.add(id));
               } catch { /* ignore */ }
             }
-            // Enrich shards with RS member info
-            for (const sh of d.shards ?? []) {
-              if (sh.isReplicaSet && sh._id) {
-                try {
-                  const { data: rs } = await api('replica_sets/' + sh._id);
-                  sh._rsMembers = rs?.members ?? [];
-                } catch { /* ignore */ }
-              }
-            }
-            parts.push(renderShardedCluster(d));
           }
+          shardParts.push(renderShardedCluster(d));
         }
       } catch { /* unreachable */ }
 
+      // ── Standalone servers (exclude members of clusters) ─────────────
+      const standaloneParts = [];
+      try {
+        const { data } = await api('servers');
+        for (const item of data?.servers ?? []) {
+          if (usedServerIds.has(item.id)) continue;
+          const { data: d } = await api('servers/' + item.id);
+          if (d) standaloneParts.push(renderServer(d));
+        }
+      } catch { /* unreachable */ }
+
+      const parts = [...standaloneParts, ...rsParts, ...shardParts];
       const el = document.getElementById('cluster-list');
       el.innerHTML = parts.length
         ? parts.join('')
